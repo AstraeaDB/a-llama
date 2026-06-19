@@ -16,11 +16,16 @@ name = "a-llama"
 path = "src/main.rs"
 
 [dependencies]
-astraea-core = { path = "/Users/jimharris/Documents/astraeadb/crates/astraea-core" }
-astraea-graph = { path = "/Users/jimharris/Documents/astraeadb/crates/astraea-graph", features = ["test-utils"] }
-astraea-vector = { path = "/Users/jimharris/Documents/astraeadb/crates/astraea-vector" }
-astraea-rag = { path = "/Users/jimharris/Documents/astraeadb/crates/astraea-rag" }
-eunomia-core = { path = "/Users/jimharris/Documents/astraea-development/projects/eunomia/crates/eunomia-core" }
+# AstraeaDB crates (in-process graph + vector store + GraphRAG), as git
+# dependencies pinned to the rev matching astradb 0.1.12 — the API a-llama was
+# built and verified against. To develop against a local checkout, replace these
+# with `path = "../astraeadb/crates/<crate>"`.
+astraea-core = { git = "https://github.com/AstraeaDB/AstraeaDB-Official.git", rev = "409977c" }
+astraea-graph = { git = "https://github.com/AstraeaDB/AstraeaDB-Official.git", rev = "409977c", features = ["test-utils"] }
+astraea-vector = { git = "https://github.com/AstraeaDB/AstraeaDB-Official.git", rev = "409977c" }
+astraea-rag = { git = "https://github.com/AstraeaDB/AstraeaDB-Official.git", rev = "409977c" }
+# Eunomia semantic-cache engine, vendored (default hnsw_rs backend). See vendor/.
+eunomia-core = { path = "vendor/eunomia-core" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 anyhow = "1"
@@ -41,7 +46,7 @@ mistralrs = { version = "0.8", optional = true, default-features = true }
 # Optional/feature-gated so the default build stays in-memory and lightweight.
 # Requires astraedb >= 0.1.11 (overflow records #26 + WAL append fix #27 +
 # persisted-HNSW restart).
-astraea-storage = { path = "/Users/jimharris/Documents/astraeadb/crates/astraea-storage", optional = true }
+astraea-storage = { git = "https://github.com/AstraeaDB/AstraeaDB-Official.git", rev = "409977c", optional = true }
 
 [features]
 default = []
