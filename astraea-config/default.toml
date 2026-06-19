@@ -1,0 +1,3 @@
+# Launcher profile pinned for this project. For embedded mode the
+# launcher will refuse to start an instance — AstraeaDB runs in-process.
+profile = "single-node-embedded"

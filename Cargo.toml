@@ -1,0 +1,54 @@
+[package]
+name = "a-llama"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+
+# Prevent Cargo from walking up into any parent workspace.
+[workspace]
+
+[lib]
+name = "a_llama"
+path = "src/lib.rs"
+
+[[bin]]
+name = "a-llama"
+path = "src/main.rs"
+
+[dependencies]
+astraea-core = { path = "/Users/jimharris/Documents/astraeadb/crates/astraea-core" }
+astraea-graph = { path = "/Users/jimharris/Documents/astraeadb/crates/astraea-graph", features = ["test-utils"] }
+astraea-vector = { path = "/Users/jimharris/Documents/astraeadb/crates/astraea-vector" }
+astraea-rag = { path = "/Users/jimharris/Documents/astraeadb/crates/astraea-rag" }
+eunomia-core = { path = "/Users/jimharris/Documents/astraea-development/projects/eunomia/crates/eunomia-core" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+anyhow = "1"
+async-trait = "0.1"
+tokio = { version = "1", features = ["full"] }
+axum = "0.8"
+futures = "0.3"
+
+# Real inference backends are feature-gated so the default build stays fast
+# during M1 wiring (Decision 7659: swappable InferenceEngine trait,
+# mistral.rs default + llama-cpp-2 fallback). Verified against the mistral.rs
+# 0.8 public API (GgufModelBuilder / EmbeddingModelBuilder, see src/inference.rs);
+# latest published is 0.8.1. Pulled in only under `mistralrs-engine`.
+mistralrs = { version = "0.8", optional = true, default-features = true }
+
+# Durable persistence (Task 8): back the KnowledgeStore graph with
+# astraea-storage::DiskStorageEngine so learned knowledge survives restarts.
+# Optional/feature-gated so the default build stays in-memory and lightweight.
+# Requires astraedb >= 0.1.11 (overflow records #26 + WAL append fix #27 +
+# persisted-HNSW restart).
+astraea-storage = { path = "/Users/jimharris/Documents/astraeadb/crates/astraea-storage", optional = true }
+
+[features]
+default = []
+mistralrs-engine = ["dep:mistralrs"]
+durable = ["dep:astraea-storage"]
+
+[dev-dependencies]
+# `tower::ServiceExt::oneshot` drives the axum Router directly in integration
+# tests without binding a socket.
+tower = { version = "0.5", features = ["util"] }

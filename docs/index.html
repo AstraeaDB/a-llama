@@ -1,0 +1,493 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>a-llama — embedded Ollama replacement with continual learning</title>
+<style>
+  :root{
+    --bg:#0e1116; --panel:#161b22; --panel2:#1c2330; --ink:#d7dee8; --muted:#8b97a7;
+    --accent:#6ea8fe; --accent2:#7ee2b8; --warn:#f0b86e; --line:#2a3340; --code:#0b0e13;
+    --max:980px;
+  }
+  *{box-sizing:border-box}
+  html{scroll-behavior:smooth}
+  body{margin:0;background:var(--bg);color:var(--ink);
+    font:16px/1.6 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif}
+  code,pre,.mono{font-family:"SF Mono",ui-monospace,Menlo,Consolas,monospace}
+  a{color:var(--accent);text-decoration:none}
+  a:hover{text-decoration:underline}
+  .wrap{display:flex;max-width:1280px;margin:0 auto}
+  nav{position:sticky;top:0;align-self:flex-start;height:100vh;overflow:auto;
+    width:250px;padding:24px 16px;border-right:1px solid var(--line);font-size:13.5px}
+  nav h4{color:var(--muted);text-transform:uppercase;letter-spacing:.08em;font-size:11px;margin:18px 0 6px}
+  nav a{display:block;color:var(--muted);padding:3px 8px;border-radius:6px}
+  nav a:hover{background:var(--panel);color:var(--ink);text-decoration:none}
+  main{flex:1;min-width:0;padding:40px 48px;max-width:var(--max)}
+  header.hero{padding:8px 0 28px;border-bottom:1px solid var(--line);margin-bottom:28px}
+  .hero h1{font-size:34px;margin:0 0 6px;letter-spacing:-.5px}
+  .hero .tag{color:var(--muted);font-size:18px}
+  .badges{margin-top:16px;display:flex;gap:8px;flex-wrap:wrap}
+  .badge{background:var(--panel);border:1px solid var(--line);border-radius:999px;
+    padding:3px 11px;font-size:12.5px;color:var(--muted)}
+  .badge b{color:var(--accent2)}
+  h2{font-size:24px;margin:44px 0 12px;padding-top:8px;border-top:1px solid var(--line)}
+  h3{font-size:18px;margin:26px 0 8px;color:#eef3fa}
+  h2:first-of-type{border-top:0}
+  p,li{color:var(--ink)}
+  .muted{color:var(--muted)}
+  pre{background:var(--code);border:1px solid var(--line);border-radius:10px;
+    padding:14px 16px;overflow:auto;font-size:13px;line-height:1.5}
+  code:not(pre code){background:var(--panel2);border:1px solid var(--line);
+    border-radius:5px;padding:.5px 5px;font-size:13px;color:#cfe1ff}
+  table{border-collapse:collapse;width:100%;margin:12px 0;font-size:14px}
+  th,td{border:1px solid var(--line);padding:8px 11px;text-align:left;vertical-align:top}
+  th{background:var(--panel);color:#eef3fa;font-weight:600}
+  tr:nth-child(even) td{background:#12161d}
+  .card{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:16px 18px;margin:14px 0}
+  .grid{display:grid;grid-template-columns:1fr 1fr;gap:14px}
+  .note{border-left:3px solid var(--accent);background:#121a26;padding:10px 14px;border-radius:0 8px 8px 0;margin:14px 0}
+  .warn{border-left:3px solid var(--warn);background:#1e1a12}
+  .ok{border-left:3px solid var(--accent2);background:#10201a}
+  .diagram{background:var(--code);border:1px solid var(--line);border-radius:10px;
+    padding:16px;overflow:auto;font-size:12px;line-height:1.35;color:#bcd}
+  .kbd{color:var(--accent2)}
+  footer{margin:48px 0 0;padding-top:18px;border-top:1px solid var(--line);color:var(--muted);font-size:13px}
+  @media(max-width:860px){nav{display:none}main{padding:24px}}
+</style>
+</head>
+<body>
+<div class="wrap">
+<nav>
+  <strong style="font-size:15px">a&#8209;llama</strong>
+  <h4>Start</h4>
+  <a href="#intro">A gentle introduction</a>
+  <a href="#overview">Overview</a>
+  <a href="#embedded">Two "embedded" meanings</a>
+  <a href="#architecture">Architecture</a>
+  <a href="#loop">The continual-learning loop</a>
+  <h4>Internals</h4>
+  <a href="#components">Components</a>
+  <a href="#knowledge-store">KnowledgeStore</a>
+  <a href="#exact-index">ExactVectorIndex</a>
+  <a href="#inference">Inference engine</a>
+  <a href="#augment">Augmenter (GraphRAG)</a>
+  <a href="#cache">SemanticCache</a>
+  <a href="#extract">Fact extraction</a>
+  <a href="#orchestrator">Orchestrator</a>
+  <h4>Use</h4>
+  <a href="#api">HTTP API</a>
+  <a href="#config">Configuration</a>
+  <a href="#build">Build &amp; run</a>
+  <a href="#durable">Durable persistence</a>
+  <h4>Reference</h4>
+  <a href="#layout">Project layout</a>
+  <a href="#decisions">Design decisions</a>
+  <a href="#status">Status &amp; roadmap</a>
+</nav>
+
+<main>
+<header class="hero">
+  <h1>a-llama</h1>
+  <div class="tag">A fully-embedded Ollama replacement with continual learning.</div>
+  <div class="badges">
+    <span class="badge">single binary</span>
+    <span class="badge">in-process <b>AstraeaDB</b> + <b>Eunomia</b></span>
+    <span class="badge">Ollama-compatible API</span>
+    <span class="badge">no server processes</span>
+    <span class="badge">status: <b>feature-complete</b></span>
+  </div>
+</header>
+
+<section id="intro">
+<h2>A gentle introduction</h2>
+<p>
+If you've used <strong>Ollama</strong>, you already know a-llama's starting point: run a
+local LLM, talk to it over a simple HTTP API, no cloud required. a-llama speaks that same
+API — so existing Ollama clients, scripts, and SDKs can point at it unchanged — but it adds
+one thing Ollama doesn't have: <strong>a memory that grows</strong>. Ollama answers your
+question and forgets it. a-llama answers, <em>remembers</em>, and gets more useful the more
+you use it — without ever retraining the model.
+</p>
+<p>
+The trick isn't magic and it isn't fine-tuning. Every exchange is embedded and stored — in
+a fast semantic cache for "have I seen this before?", and in an embedded knowledge graph for
+the long haul. When a new question arrives, a-llama quietly looks up what it already knows
+that's relevant and folds it into the prompt <em>before</em> the model answers. Turn on
+durable mode and that memory is written to disk, so it's still there after a reboot. It all
+runs in <strong>one process</strong> — the model, the database, and the vector search — with
+no servers to deploy.
+</p>
+
+<h3>What it can really do</h3>
+<ul>
+  <li><strong>Be a drop-in local LLM server.</strong> Point any Ollama-compatible client at
+    it for <code>generate</code>, <code>chat</code>, and <code>embeddings</code>.</li>
+  <li><strong>Remember across questions — and restarts.</strong> Repeat or rephrase
+    something and it's served from memory (in our test, ~15× faster); with durable mode that
+    memory survives a process restart.</li>
+  <li><strong>Learn facts as you talk.</strong> With extraction enabled it distills facts and
+    named entities from conversations into a knowledge graph you can actually inspect.</li>
+  <li><strong>Use what it learned to answer better.</strong> A later, differently-worded
+    question pulls the relevant stored knowledge back into the prompt (GraphRAG) instead of
+    starting from scratch.</li>
+  <li><strong>Run entirely offline and embedded.</strong> Single binary, in-process
+    database, no network for storage — suitable for air-gapped or privacy-sensitive use.</li>
+</ul>
+<div class="note"><strong>Honest framing.</strong> a-llama is "Ollama <em>plus</em> an
+embedded learning memory." The <em>quality</em> of answers and extracted facts tracks
+whichever GGUF model you load — a tiny model is crude, a stronger one is much better; what
+a-llama adds is the durable, retrievable memory around it. It runs one model at a time and
+targets the common Ollama verbs (not yet the full model-management surface — see the
+<a href="#status">roadmap</a>).</div>
+
+<h3>Sample use cases</h3>
+<div class="grid">
+  <div class="card"><h3 style="margin-top:0">🧠 A local assistant that remembers you</h3>
+    Use a-llama as the backend for your chat or coding tool. Tell it your stack, conventions,
+    and preferences <em>once</em>; with durable mode on, it recalls them tomorrow after a
+    reboot — no re-explaining, no fine-tuning job.</div>
+  <div class="card"><h3 style="margin-top:0">📓 A notebook that answers back</h3>
+    Turn on fact extraction and just talk to it about a project, a codebase, or your research.
+    It builds a knowledge graph as you go, then surfaces the right facts when you ask a
+    related question later — a self-building knowledge base from plain conversation.</div>
+  <div class="card"><h3 style="margin-top:0">⚡ A semantic cache for an LLM</h3>
+    Put a-llama in front of an FAQ, support, or docs bot where people ask the same things many
+    ways. Semantically-equivalent repeat questions come back from cache in ~0.1&nbsp;s with the
+    same answer — cheaper and faster than regenerating every time.</div>
+  <div class="card"><h3 style="margin-top:0">🔒 An offline / private assistant</h3>
+    One binary, no server, no cloud, no network for storage. Drop it into a desktop app, an
+    edge device, or an air-gapped environment where data can't leave the machine — model,
+    memory, and search all live in-process.</div>
+  <div class="card"><h3 style="margin-top:0">🔬 A continual-learning testbed</h3>
+    Researching "can an LLM keep learning without retraining?" a-llama is a working harness:
+    the learn→store→retrieve→augment loop, durable memory, and an inspectable knowledge graph.
+    Swap the model, tune retrieval, measure.</div>
+</div>
+<p class="muted">Ready to try it? Jump to <a href="#build">Build &amp; run</a> — the default
+build boots instantly with a built-in mock engine; add a GGUF model when you want real
+answers.</p>
+</section>
+
+<section id="overview">
+<h2>Overview</h2>
+<p>
+a-llama is a <strong>single binary</strong>: a local LLM inference daemon that speaks an
+<strong>Ollama-compatible HTTP API</strong> to client tools, with <strong>AstraeaDB</strong>
+(graph + vector store) and <strong>Eunomia</strong> (semantic cache) compiled
+<em>in-process</em> as its memory subsystem. There is no separate database server and no
+network daemon for storage.
+</p>
+<p>
+Its differentiator is <strong>continual learning by retrieval-augmentation</strong>: rather
+than updating model weights, a-llama persists what it sees — interactions, distilled facts,
+linked entities — into its embedded knowledge graph and semantic cache, then feeds that
+knowledge back into future prompts. With durable persistence enabled, what it learns
+<strong>survives a process restart</strong>: a question answered in one process is recalled
+instantly by a fresh process from the same data directory — continual learning without
+retraining.
+</p>
+<div class="note ok"><strong>Verified live.</strong> Running the real engine (mistral.rs
+<code>qwen2.5</code> chat + <code>embeddinggemma</code> 768-dim embedder), a question answered
+in 10&nbsp;s in one process is recalled in 0.10&nbsp;s by a fresh process from the same
+<code>A_LLAMA_DATA_DIR</code> after a restart.</div>
+</section>
+
+<section id="embedded">
+<h2>The two meanings of "embedded"</h2>
+<p>These are deliberately kept separate (design decision 7657):</p>
+<div class="grid">
+  <div class="card"><h3 style="margin-top:0">AstraeaDB is embedded</h3>
+    Linked as an in-process <em>library</em> (<code>astraea-graph::Graph</code>) — no separate
+    Astraea server, no ports, no network. This is the project's "embedded" constraint.</div>
+  <div class="card"><h3 style="margin-top:0">a-llama is a local daemon</h3>
+    a-llama itself <em>does</em> expose an HTTP API over <code>axum</code> + <code>tokio</code>.
+    That local API is the product — the drop-in Ollama replacement. It is <em>not</em> an
+    Astraea network surface.</div>
+</div>
+</section>
+
+<section id="architecture">
+<h2>Architecture</h2>
+<pre class="diagram">
+                        a-llama (single binary)
+  client (ollama CLI,  ┌───────────────────────────────────────────────────────┐
+  curl, SDKs)          │  HTTP API layer (axum/tokio)                           │
+  ───────────────────► │  /api/generate  /api/chat  /api/embeddings  /api/tags  │
+   Ollama-compatible   │            │                                           │
+   JSON / NDJSON       │            ▼                                           │
+                       │  Orchestrator  (learn → store → retrieve → augment)    │
+                       │     1 embed   2 cache lookup   3 GraphRAG augment       │
+                       │     4 infer   5 store/learn   6 tier   (7 extract)      │
+                       │      │            │                  │                  │
+                       │      ▼            ▼                  ▼                  │
+                       │ ┌ Inference ┐ ┌ Eunomia (hot) ┐ ┌ AstraeaDB (long-term)┐│
+                       │ │ mistral.rs│ │ SemanticCache │ │ KnowledgeStore: graph ││
+                       │ │ GGUF chat │ │ hnsw_rs +TTL  │ │ + ExactVectorIndex     ││
+                       │ │ + embedder│ │ +WAL/snapshot │ │ CacheEntry/Fact/Entity ││
+                       │ │ (or Mock) │ └───────────────┘ │ InMemory | DiskStorage ││
+                       │ └───────────┘                   └────────────────────────┘│
+                       └───────────────────────────────────────────────────────┘
+</pre>
+<p>Everything in the box is one process. The inference engine is swappable
+(<code>MockEngine</code> for tests/default, mistral.rs for the real backend). The long-term
+store can be in-memory (default) or durable (<code>DiskStorageEngine</code>).</p>
+</section>
+
+<section id="loop">
+<h2>The continual-learning loop</h2>
+<p>Each request runs <strong>learn → store → retrieve → augment</strong>:</p>
+<ol>
+  <li><strong>Embed</strong> the incoming prompt (768-dim, the in-process embedder).</li>
+  <li><strong>Retrieve (hot)</strong> — probe the Eunomia <code>SemanticCache</code>; a
+    high-similarity hit can short-circuit to the cached response.</li>
+  <li><strong>Augment (long-term)</strong> — on a miss, run a GraphRAG query over the learned
+    knowledge graph: vector search → subgraph (BFS) expansion → linearize → splice the context
+    into the prompt.</li>
+  <li><strong>Infer</strong> — the engine generates from the augmented prompt.</li>
+  <li><strong>Learn / store</strong> — write the interaction to the hot cache (with TTL).</li>
+  <li><strong>Tier</strong> — evicted cache entries are flushed into the durable graph as
+    retrievable <code>CacheEntry</code> nodes.</li>
+  <li><strong>Extract (opt-in)</strong> — an LLM pass distills <code>Fact</code>/<code>Entity</code>
+    nodes + edges so individual facts become independently retrievable.</li>
+</ol>
+<p>Over time the graph accumulates the model's "experience," and step&nbsp;3 surfaces it back.</p>
+</section>
+
+<section id="components">
+<h2>Components</h2>
+<table>
+  <tr><th>Module</th><th>Type</th><th>Role</th></tr>
+  <tr><td><code>src/knowledge_store.rs</code></td><td><code>KnowledgeStore</code></td>
+    <td>In-process AstraeaDB graph + vector index; the long-term memory.</td></tr>
+  <tr><td><code>src/exact_index.rs</code></td><td><code>ExactVectorIndex</code></td>
+    <td>Exact brute-force <code>VectorIndex</code> — perfect recall for the knowledge graph.</td></tr>
+  <tr><td><code>src/inference.rs</code></td><td><code>InferenceEngine</code>, <code>MockEngine</code>, <code>MistralRsEngine</code>, <code>EngineProvider</code></td>
+    <td>Swappable inference + the adapters that plug it into GraphRAG.</td></tr>
+  <tr><td><code>src/augment.rs</code></td><td><code>Augmenter</code></td>
+    <td>GraphRAG retrieval/augment loop over the KnowledgeStore.</td></tr>
+  <tr><td><code>src/cache.rs</code></td><td><code>SemanticCache</code></td>
+    <td>Eunomia hot semantic cache (prompt→response) with TTL + durability.</td></tr>
+  <tr><td><code>src/extract.rs</code></td><td><code>Extractor</code></td>
+    <td>LLM-based Fact/Entity extraction into the graph.</td></tr>
+  <tr><td><code>src/api.rs</code></td><td><code>AppState</code>, <code>router</code></td>
+    <td>The orchestrator + the Ollama-compatible axum router.</td></tr>
+  <tr><td><code>src/main.rs</code></td><td>binary</td>
+    <td>Engine &amp; storage selection from env; serves with graceful-shutdown persist.</td></tr>
+</table>
+
+<h3 id="knowledge-store">KnowledgeStore</h3>
+<p>Wraps an in-process <code>astraea_graph::Graph</code> with an attached
+<code>ExactVectorIndex</code> pinned to 768-dim. Three node kinds and three edge types form the
+schema:</p>
+<pre class="diagram">(Fact {text, source_id, confidence, created_at, embedding})
+   ─DERIVED_FROM─► (CacheEntry {eunomia_id, value, tags, …, embedding})
+   ─MENTIONS─────► (Entity {name, kind})
+(Entity) ─RELATES_TO─► (Entity)</pre>
+<p>The <code>upsert_cache_entry</code> / <code>upsert_fact</code> / <code>upsert_entity</code>
+methods are true upserts (dedup by stable key: <code>namespace+eunomia_id</code>,
+<code>source_id+text</code>, <code>kind+name</code>) — re-flushing the same item updates in
+place. Every embedded node is indexed for vector search and reachable by GraphRAG.</p>
+
+<h3 id="exact-index">ExactVectorIndex</h3>
+<p>An exact (brute-force) implementation of <code>astraea_core::VectorIndex</code> used by the
+KnowledgeStore: every <code>search</code> computes the distance to every stored vector and returns
+the k closest, so <code>recall@k = 1.0</code> by construction — the knowledge graph always
+retrieves the genuinely nearest learned items. Distances use
+<code>astraea_vector::distance::compute_distance</code>, and O(N·dim) is sub-millisecond at every
+graph size a-llama realistically reaches.</p>
+
+<h3 id="inference">Inference engine</h3>
+<p><code>InferenceEngine</code> is the swappable seam (async <code>complete</code> +
+<code>embed</code>):</p>
+<ul>
+  <li><strong>MockEngine</strong> — deterministic, dependency-free; canned completions and stable
+    768-dim pseudo-embeddings. The default build and all tests use it.</li>
+  <li><strong>MistralRsEngine</strong> <span class="muted">(feature <code>mistralrs-engine</code>)</span>
+    — real mistral.rs 0.8 backend: a GGUF chat model + an <code>embeddinggemma</code> embedder.
+    The embedder is forced to <strong>F32</strong> (it returns all-zeros under the default F16 on
+    CPU) and its output dimension is probed and required to be 768 at load.</li>
+  <li><strong>EngineProvider</strong> — adapts any engine to <code>astraea_rag</code>'s synchronous
+    <code>LlmProvider</code> + <code>EmbeddingProvider</code> for GraphRAG, bridging async→sync via
+    <code>block_in_place</code> (hence the multi-thread runtime requirement).</li>
+</ul>
+
+<h3 id="augment">Augmenter (GraphRAG)</h3>
+<p>Drives <code>astraea_rag::graph_rag_query</code> over the KnowledgeStore + EngineProvider:
+embed the question → vector-search an anchor node → BFS-expand the subgraph → linearize to text
+under a token budget → assemble the augmented prompt. Must run on a multi-thread Tokio runtime.</p>
+
+<h3 id="cache">SemanticCache</h3>
+<p>Wraps <code>eunomia_core::Store</code> as the hot prompt→response cache: <code>lookup</code>
+(threshold-gated nearest-neighbour, TTL-filtered), <code>store_interaction</code> (stable id,
+TTL), <code>sweep_expired</code>. In durable mode it recovers from a WAL + snapshot.</p>
+
+<h3 id="extract">Fact extraction</h3>
+<p>Opt-in (<code>A_LLAMA_EXTRACT_FACTS=1</code>). On a cache miss, an extra LLM pass over the
+prompt→response exchange emits JSON that a tolerant parser turns into <code>Fact</code>/<code>Entity</code>
+nodes + edges. It runs <strong>detached</strong> (never blocks the HTTP response) and errors are
+swallowed. Quality scales with the chat model.</p>
+
+<h3 id="orchestrator">Orchestrator</h3>
+<p><code>AppState</code> holds the engine, the shared <code>KnowledgeStore</code> (also used by the
+Augmenter), and the <code>SemanticCache</code> behind a lock. <code>generate()</code> runs the full
+loop; <code>tier_evicted()</code> flushes evicted entries; <code>persist()</code> writes durable
+state. The <code>router</code> exposes the Ollama API.</p>
+</section>
+
+<section id="api">
+<h2>Ollama-compatible HTTP API</h2>
+<table>
+  <tr><th>Method &amp; path</th><th>Purpose</th></tr>
+  <tr><td><code>POST /api/generate</code></td><td>Single-prompt generation (JSON or NDJSON stream).</td></tr>
+  <tr><td><code>POST /api/chat</code></td><td>Multi-message chat (messages flattened to a prompt).</td></tr>
+  <tr><td><code>POST /api/embeddings</code></td><td>Legacy embeddings — <code>{embedding:[…]}</code> (768-dim).</td></tr>
+  <tr><td><code>POST /api/embed</code></td><td>New embeddings — <code>{embeddings:[[…]]}</code>.</td></tr>
+  <tr><td><code>GET /api/tags</code></td><td>List available models.</td></tr>
+  <tr><td><code>GET /api/version</code></td><td>Version info.</td></tr>
+  <tr><td><code>GET /</code></td><td>Health — <code>"Ollama is running"</code>.</td></tr>
+</table>
+<p class="muted">A lenient body extractor parses requests regardless of <code>Content-Type</code>, so
+plain <code>curl -d</code> works as a drop-in. Streaming is currently post-hoc chunking (see roadmap).</p>
+<pre>curl http://127.0.0.1:11434/api/tags
+
+curl http://127.0.0.1:11434/api/generate \
+  -d '{"model":"q","prompt":"What is a knowledge graph?","stream":false}'
+
+curl http://127.0.0.1:11434/api/chat \
+  -d '{"model":"q","messages":[{"role":"user","content":"hi"}],"stream":false}'
+
+curl http://127.0.0.1:11434/api/embeddings -d '{"model":"q","prompt":"vectors"}'</pre>
+</section>
+
+<section id="config">
+<h2>Configuration</h2>
+<h3>Environment variables</h3>
+<table>
+  <tr><th>Variable</th><th>Default</th><th>Effect</th></tr>
+  <tr><td><code>A_LLAMA_ADDR</code></td><td><code>127.0.0.1:11434</code></td><td>Bind address (Ollama's port).</td></tr>
+  <tr><td><code>A_LLAMA_ENGINE</code></td><td><span class="muted">(mock)</span></td><td><code>mistralrs</code> selects the real engine (needs the feature); else MockEngine.</td></tr>
+  <tr><td><code>A_LLAMA_GGUF</code></td><td>—</td><td>Absolute path to the chat GGUF (or use the pair below).</td></tr>
+  <tr><td><code>A_LLAMA_MODEL_DIR</code> + <code>A_LLAMA_MODEL_FILE</code></td><td>—</td><td>Chat GGUF as dir + filename.</td></tr>
+  <tr><td><code>A_LLAMA_CHAT_TEMPLATE</code></td><td>—</td><td>Optional chat-template JSON for GGUFs lacking one.</td></tr>
+  <tr><td><code>A_LLAMA_EMBED_MODEL</code></td><td><code>google/embeddinggemma-300m</code></td><td>768-dim embedder (HF id; gated — needs a token).</td></tr>
+  <tr><td><code>A_LLAMA_EXTRACT_FACTS</code></td><td><code>0</code></td><td><code>1</code>/<code>true</code> enables detached fact extraction (extra LLM call per miss).</td></tr>
+  <tr><td><code>A_LLAMA_DATA_DIR</code></td><td>—</td><td>Durable mode (needs <code>--features durable</code>): persist graph + cache here.</td></tr>
+</table>
+<h3>Cargo features</h3>
+<table>
+  <tr><th>Feature</th><th>Effect</th></tr>
+  <tr><td><span class="muted">(default)</span></td><td>In-memory storage + MockEngine. Fast, no model file, no network.</td></tr>
+  <tr><td><code>mistralrs-engine</code></td><td>Compiles the real mistral.rs backend (heavy: candle, etc.).</td></tr>
+  <tr><td><code>durable</code></td><td>Compiles <code>astraea-storage</code> disk persistence + cache WAL/snapshot.</td></tr>
+</table>
+<p class="muted">Engine choice and storage choice are orthogonal — any combination of
+<code>mistralrs-engine</code> × <code>durable</code> works.</p>
+</section>
+
+<section id="build">
+<h2>Build &amp; run</h2>
+<h3>Default (mock engine, in-memory) — instant</h3>
+<pre>cargo run --release
+# → a-llama listening on http://127.0.0.1:11434 (model: mock-gguf)</pre>
+
+<h3>Real engine (mistral.rs)</h3>
+<pre>cargo build --release --features mistralrs-engine
+
+A_LLAMA_ENGINE=mistralrs \
+A_LLAMA_GGUF=/abs/path/to/model.gguf \
+A_LLAMA_EMBED_MODEL=google/embeddinggemma-300m \
+  ./target/release/a-llama
+# Needs an HF token at ~/.cache/huggingface/token (embeddinggemma is gated).</pre>
+
+<h3>Durable (survives restart)</h3>
+<pre>cargo build --release --features durable          # or: mistralrs-engine,durable
+A_LLAMA_DATA_DIR=/var/lib/a-llama ./target/release/a-llama
+# Ctrl-C / SIGTERM flushes graph + cache to disk; next start replays them.</pre>
+
+<h3>Fact extraction</h3>
+<pre>A_LLAMA_EXTRACT_FACTS=1 ./target/release/a-llama</pre>
+
+<h3>Tests &amp; benchmarks</h3>
+<pre>cargo test                       # 80 unit + 16 integration (default)
+cargo test --features durable    # 84 unit + 16 integration
+cargo run --release --example recall   # vector-index recall benchmark</pre>
+</section>
+
+<section id="durable">
+<h2>Durable persistence</h2>
+<p>With <code>--features durable</code> + <code>A_LLAMA_DATA_DIR</code>:</p>
+<ul>
+  <li><strong>Graph</strong> → <code>DiskStorageEngine</code> (WAL replay on open; ids resume via
+    <code>Graph::with_start_ids</code>).</li>
+  <li><strong>Vector index</strong> → the <code>ExactVectorIndex</code> is rebuilt from the
+    persisted node embeddings on open (no index file to corrupt).</li>
+  <li><strong>Dedup indexes</strong> → reconstructed by walking the persisted nodes.</li>
+  <li><strong>Cache</strong> → Eunomia recovers from a WAL + snapshot (puts are logged before
+    apply; evictions logged as deletes).</li>
+  <li><strong>Shutdown</strong> → a SIGTERM/SIGINT handler calls <code>persist()</code>
+    (flushes the buffer pool + cache snapshot).</li>
+</ul>
+<p>On-disk layout: <code>&lt;dir&gt;/graph/astraea.db</code>, <code>graph/astraea.wal</code>,
+<code>cache.snap</code>, <code>cache.wal</code>. Requires <strong>astradb ≥ 0.1.11</strong>
+(overflow records + WAL append fix).</p>
+</section>
+
+<section id="layout">
+<h2>Project layout</h2>
+<pre>projects/a-llama/
+├── Cargo.toml            # deps + features (mistralrs-engine, durable)
+├── DESIGN.md             # architecture + task table + decisions
+├── NEXT-SESSION.md       # prioritized backlog (this project's roadmap)
+├── docs/index.html       # this document
+├── examples/
+│   └── recall.rs         # vector-index recall benchmark
+└── src/
+    ├── lib.rs            # module declarations
+    ├── main.rs           # binary: engine/storage selection, serve + persist
+    ├── api.rs            # orchestrator (AppState) + Ollama-compatible router
+    ├── knowledge_store.rs# embedded AstraeaDB graph + vector index
+    ├── exact_index.rs    # ExactVectorIndex (perfect recall)
+    ├── inference.rs      # InferenceEngine / Mock / MistralRs / EngineProvider
+    ├── augment.rs        # GraphRAG Augmenter
+    ├── cache.rs          # Eunomia SemanticCache
+    └── extract.rs        # LLM fact/entity extraction</pre>
+</section>
+
+<section id="decisions">
+<h2>Key design decisions</h2>
+<table>
+  <tr><th>#</th><th>Decision</th></tr>
+  <tr><td>7659</td><td>Swappable <code>InferenceEngine</code> trait; mistral.rs default, llama-cpp-2 as a future fallback.</td></tr>
+  <tr><td>7660</td><td>Embedding model = <code>embeddinggemma</code>, dim 768 — pinned across cache, graph index, and embedder.</td></tr>
+  <tr><td>7657</td><td>Two distinct "embedded" meanings: embedded AstraeaDB library vs a-llama's own HTTP daemon.</td></tr>
+  <tr><td>7658</td><td>AstraeaDB crate set: core, graph, vector, rag (+ storage behind <code>durable</code>); exclude server/flight/mcp/cluster.</td></tr>
+  <tr><td>2145</td><td>Durable tiering is native (flush into a-llama's own graph) — <em>not</em> the eunomia-astraea bridge (it owns a separate graph).</td></tr>
+</table>
+<p class="muted">Full decision/note/issue history lives in the project KG (project <code>a-llama</code>).</p>
+</section>
+
+<section id="status">
+<h2>Status &amp; roadmap</h2>
+<div class="note ok"><strong>Feature-complete.</strong> M1 (daemon) + M2 (tiering, durability,
+extraction, tests) + the real engine are all done, committed, and live-verified.</div>
+<p>The optional roadmap lives in <code>NEXT-SESSION.md</code>, prioritized:</p>
+<ul>
+  <li><strong>P1</strong> — relax the now-fixed #26 truncation workaround; true token streaming;
+    native multi-turn chat.</li>
+  <li><strong>P2</strong> — model-management API (pull/Modelfile/multi-model); local GGUF embedder
+    (drop the HF gate).</li>
+  <li><strong>P3</strong> — extraction quality (bigger model); load testing; <code>/promote</code>
+    to a standalone repo.</li>
+  <li><strong>Optional</strong> — a hybrid exact/approximate vector index, if very large graphs ever warrant sub-linear search.</li>
+</ul>
+</section>
+
+<footer>
+  a-llama — generated documentation · see <code>DESIGN.md</code> and
+  <code>NEXT-SESSION.md</code> for source detail.
+</footer>
+</main>
+</div>
+</body>
+</html>
