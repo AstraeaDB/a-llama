@@ -57,16 +57,18 @@
 //!
 //! - `DiskStorageEngine::open(data_dir/"graph")` replays the WAL so all
 //!   previously persisted nodes and edges are immediately visible.
-//! - A fresh [`ExactVectorIndex`] is attached via `Graph::set_vector_index`.
-//!   It is then populated by inserting each persisted node's embedding during
-//!   the dedup-index rebuild walk (CacheEntry / Fact / Entity). No snapshot
-//!   file is written or loaded — the exact index is always rebuilt from the
-//!   authoritative graph storage in O(nodes · dim), which is fast enough that
-//!   the cost is negligible at every realistic corpus size.
+//! - A fresh [`ExactVectorIndex`] is attached via `Graph::set_vector_index` and
+//!   then repopulated by `Graph::rebuild_vector_index`, which walks **every**
+//!   persisted node and reinserts any that carry an embedding — regardless of
+//!   label. No snapshot file is written or loaded — the exact index is always
+//!   rebuilt from the authoritative graph storage in O(nodes · dim), which is
+//!   fast enough that the cost is negligible at every realistic corpus size.
 //! - The three dedup indexes (`cache_entry_index`, `fact_index`, `entity_index`)
 //!   are reconstructed by scanning persisted nodes labelled `"CacheEntry"`,
 //!   `"Fact"`, and `"Entity"` respectively, so that re-`upsert` calls on the
-//!   same stable key update in-place rather than duplicating.
+//!   same stable key update in-place rather than duplicating. This dedup walk is
+//!   independent of the vector-index rebuild above, so embedding-bearing nodes
+//!   under other labels (e.g. a caller-created `"Product"`) are still indexed.
 //!
 //! Call [`KnowledgeStore::persist`] before dropping to flush the buffer pool
 //! to disk. WAL durability is unconditional (astraeadb #27 fix); `persist`
@@ -222,11 +224,14 @@ impl KnowledgeStore {
     ///    id allocation where the previous session left off.
     /// 3. A fresh [`ExactVectorIndex`] is attached via `Graph::set_vector_index`.
     ///    No snapshot file is loaded — the exact index is always rebuilt from the
-    ///    authoritative graph storage during step 4.
+    ///    authoritative graph storage during step 5.
     /// 4. The three dedup indexes are rebuilt by scanning `"CacheEntry"`,
-    ///    `"Fact"`, and `"Entity"` nodes from storage. **During this same walk**,
-    ///    each node's embedding is inserted into the `ExactVectorIndex` so the
-    ///    vector index is fully populated by the time `open_durable` returns.
+    ///    `"Fact"`, and `"Entity"` nodes from storage, so re-`upsert` of the same
+    ///    stable key updates in-place rather than duplicating.
+    /// 5. `Graph::rebuild_vector_index` repopulates the vector index from **every**
+    ///    persisted embedding-bearing node — independent of the dedup labels — so
+    ///    the index is fully populated (including nodes under other labels such as
+    ///    a caller-created `"Product"`) by the time `open_durable` returns.
     ///
     /// For a fresh (empty) `data_dir` this is equivalent to [`with_dim`] with a
     /// `DiskStorageEngine` backend.
@@ -257,14 +262,15 @@ impl KnowledgeStore {
         let mut graph = Graph::with_start_ids(Box::new(engine), next_node_id, next_edge_id);
         graph.set_vector_index(Arc::clone(&vi));
 
-        // --- Phase 3: rebuild the three in-memory dedup indexes AND repopulate
-        //     the exact vector index from persisted node embeddings. ---
+        // --- Phase 3: rebuild the three in-memory dedup indexes. ---
         //
         // Scan every `CacheEntry`, `Fact`, and `Entity` node from storage and
         // reconstruct the same `(key → NodeId)` maps that the upsert methods
         // maintain during normal operation.  This guarantees that a re-`upsert`
         // of the same key after reopen updates in-place rather than creating a
-        // duplicate node.  Embeddings are inserted into `vi` in the same pass.
+        // duplicate node.  The vector index is repopulated separately in Phase 3b
+        // below (a general walk over all embedding-bearing nodes), so this dedup
+        // scan is deliberately *not* responsible for it.
 
         let mut cache_entry_index: HashMap<String, NodeId> = HashMap::new();
         let mut fact_index: HashMap<String, NodeId> = HashMap::new();
@@ -289,12 +295,6 @@ impl KnowledgeStore {
                         .unwrap_or("");
                     cache_entry_index.insert(format!("{ns}\x00{eid}"), node_id);
                 }
-                // Repopulate the exact vector index.
-                if let Some(ref emb) = node.embedding {
-                    vi.insert(node_id, emb).map_err(|e| {
-                        anyhow!("exact index insert for CacheEntry {node_id:?} failed: {e}")
-                    })?;
-                }
             }
         }
 
@@ -310,12 +310,6 @@ impl KnowledgeStore {
                 let src = node.properties.get("source_id").and_then(|v| v.as_str()).unwrap_or("");
                 let txt = node.properties.get("text").and_then(|v| v.as_str()).unwrap_or("");
                 fact_index.insert(format!("{src}\x00{txt}"), node_id);
-                // Repopulate the exact vector index.
-                if let Some(ref emb) = node.embedding {
-                    vi.insert(node_id, emb).map_err(|e| {
-                        anyhow!("exact index insert for Fact {node_id:?} failed: {e}")
-                    })?;
-                }
             }
         }
 
@@ -331,14 +325,23 @@ impl KnowledgeStore {
                 let kind = node.properties.get("kind").and_then(|v| v.as_str()).unwrap_or("");
                 let name = node.properties.get("name").and_then(|v| v.as_str()).unwrap_or("");
                 entity_index.insert(format!("{kind}\x00{name}"), node_id);
-                // Repopulate the exact vector index.
-                if let Some(ref emb) = node.embedding {
-                    vi.insert(node_id, emb).map_err(|e| {
-                        anyhow!("exact index insert for Entity {node_id:?} failed: {e}")
-                    })?;
-                }
             }
         }
+
+        // --- Phase 3b: repopulate the exact vector index from ALL persisted
+        //     embedding-bearing nodes, independent of the dedup label scans. ---
+        //
+        // The dedup walk above is label-driven (CacheEntry / Fact / Entity); any
+        // other embedding-bearing node — e.g. a caller-created `Product` — would
+        // otherwise be persisted but invisible to vector search after reopen
+        // (a-llama#1). `Graph::rebuild_vector_index` walks
+        // `StorageEngine::list_all_nodes` and inserts every node whose embedding
+        // is `Some(..)` into the attached index, returning the count. Inserts are
+        // idempotent (ExactVectorIndex overwrites by node_id), so this pass is
+        // authoritative regardless of what the dedup scans touched.
+        let vectors_indexed = graph
+            .rebuild_vector_index()
+            .map_err(|e| anyhow!("rebuild_vector_index failed: {e}"))?;
 
         eprintln!(
             "a-llama: durable graph opened from {data_dir:?} \
@@ -346,7 +349,7 @@ impl KnowledgeStore {
             cache_entry_index.len(),
             fact_index.len(),
             entity_index.len(),
-            vi.len(),
+            vectors_indexed,
         );
 
         Ok(Self {
@@ -1518,6 +1521,68 @@ mod durable_tests {
                 results[0].node_id,
                 *id,
                 "session {i} must be the nearest node for its own embedding"
+            );
+        }
+    }
+
+    /// Regression test for a-llama#1: `open_durable` must repopulate the vector
+    /// index from **all** embedding-bearing nodes, not just the CacheEntry /
+    /// Fact / Entity dedup labels. A caller-created `Product` node's embedding
+    /// must be searchable after a durable reopen.
+    #[test]
+    fn durable_open_reindexes_product_nodes() {
+        let dir = tmp_dir("reindex_product");
+        let dim = 4;
+        let emb = make_embedding(0, dim);
+
+        // --- Session 1: create a Product node directly via graph_ops, confirm
+        //     it is searchable live, then persist + drop. ---
+        let product_id = {
+            let store = KnowledgeStore::open_durable(&dir.0, dim).unwrap();
+
+            let id = store
+                .graph_ops()
+                .create_node(
+                    vec!["Product".to_string(), "footwear_boots".to_string()],
+                    serde_json::json!({ "sku": "BOOT-1", "name": "Trail Boot" }),
+                    Some(emb.clone()),
+                )
+                .unwrap();
+
+            // Live insert must index the Product embedding (in-memory path).
+            let live = store.vector_index_ref().search(&emb, 1).unwrap();
+            assert!(!live.is_empty(), "Product must be searchable before restart");
+            assert_eq!(live[0].node_id, id, "Product must be nearest node pre-restart");
+
+            store.persist().unwrap();
+            id
+        };
+
+        // --- Session 2: reopen and confirm the embedding survived AND was
+        //     reinserted into the vector index by open_durable. ---
+        {
+            let store = KnowledgeStore::open_durable(&dir.0, dim).unwrap();
+
+            // Embedding + label survive on the node itself.
+            let node = store.graph_ops().get_node(product_id).unwrap().unwrap();
+            assert!(
+                node.embedding.is_some(),
+                "Product embedding must survive durable reopen on the node"
+            );
+            assert!(
+                node.labels.contains(&"Product".to_string()),
+                "reopened node must retain its Product label"
+            );
+
+            // The regression: vector search must find the Product after reopen.
+            let results = store.vector_index_ref().search(&emb, 1).unwrap();
+            assert!(
+                !results.is_empty(),
+                "open_durable must rebuild the vector index for Product nodes"
+            );
+            assert_eq!(
+                results[0].node_id, product_id,
+                "reopened Product must be nearest node for its own embedding"
             );
         }
     }
