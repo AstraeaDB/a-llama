@@ -118,13 +118,12 @@ architecture, component reference, and design notes.
 
 a-llama depends on the AstraeaDB crates and the Eunomia cache engine:
 
-- **AstraeaDB** (`astraea-core`/`-graph`/`-vector`/`-rag`/`-storage`) — pulled as
-  a **git dependency** pinned to a specific rev of
-  [AstraeaDB-Official](https://github.com/AstraeaDB/AstraeaDB-Official).
-- **`eunomia-core`** — **vendored** under [`vendor/eunomia-core/`](vendor/eunomia-core)
-  (the default `hnsw_rs` backend), so no external checkout is needed.
+- **AstraeaDB** (`astraea-core`/`-graph`/`-vector`/`-rag`/`-storage`) — from
+  [crates.io](https://crates.io/crates/astraea-core) (`= "0.3.1"`).
+- **`eunomia-core`** — from [crates.io](https://crates.io/crates/eunomia-core)
+  (`= "0.1.0"`, the default `hnsw_rs` backend).
 
-To develop against a local AstraeaDB checkout, replace the `git = …` entries in
+To develop against a local AstraeaDB checkout, replace the version entries in
 `Cargo.toml` with `path = "../astraeadb/crates/<crate>"`.
 
 ## Project layout
@@ -142,7 +141,6 @@ src/
 tests/               integration tests
 examples/recall.rs   vector-index recall benchmark
 docs/index.html      full documentation
-vendor/eunomia-core  vendored semantic-cache engine
 ```
 
 ## License

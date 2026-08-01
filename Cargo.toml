@@ -3,6 +3,8 @@ name = "a-llama"
 version = "0.1.0"
 edition = "2021"
 license = "MIT"
+repository = "https://github.com/AstraeaDB/a-llama"
+description = "A fully-embedded Ollama replacement with continual learning: a local LLM daemon speaking an Ollama-compatible HTTP API, with an in-process AstraeaDB graph+vector store and Eunomia semantic cache as its memory subsystem."
 
 # Prevent Cargo from walking up into any parent workspace.
 [workspace]
@@ -16,16 +18,15 @@ name = "a-llama"
 path = "src/main.rs"
 
 [dependencies]
-# AstraeaDB crates (in-process graph + vector store + GraphRAG), as git
-# dependencies pinned to the rev matching astradb 0.1.12 — the API a-llama was
-# built and verified against. To develop against a local checkout, replace these
-# with `path = "../astraeadb/crates/<crate>"`.
-astraea-core = { git = "https://github.com/AstraeaDB/AstraeaDB-Official.git", rev = "409977c" }
-astraea-graph = { git = "https://github.com/AstraeaDB/AstraeaDB-Official.git", rev = "409977c", features = ["test-utils"] }
-astraea-vector = { git = "https://github.com/AstraeaDB/AstraeaDB-Official.git", rev = "409977c" }
-astraea-rag = { git = "https://github.com/AstraeaDB/AstraeaDB-Official.git", rev = "409977c" }
-# Eunomia semantic-cache engine, vendored (default hnsw_rs backend). See vendor/.
-eunomia-core = { path = "vendor/eunomia-core" }
+# AstraeaDB crates (in-process graph + vector store + GraphRAG), from crates.io.
+# To develop against a local checkout, replace these with
+# `path = "../astraeadb/crates/<crate>"`.
+astraea-core = "0.3.1"
+astraea-graph = { version = "0.3.1", features = ["test-utils"] }
+astraea-vector = "0.3.1"
+astraea-rag = "0.3.1"
+# Eunomia semantic-cache engine (default hnsw_rs backend), from crates.io.
+eunomia-core = "0.1.0"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 anyhow = "1"
@@ -44,9 +45,7 @@ mistralrs = { version = "0.8", optional = true, default-features = true }
 # Durable persistence (Task 8): back the KnowledgeStore graph with
 # astraea-storage::DiskStorageEngine so learned knowledge survives restarts.
 # Optional/feature-gated so the default build stays in-memory and lightweight.
-# Requires astraedb >= 0.1.11 (overflow records #26 + WAL append fix #27 +
-# persisted-HNSW restart).
-astraea-storage = { git = "https://github.com/AstraeaDB/AstraeaDB-Official.git", rev = "409977c", optional = true }
+astraea-storage = { version = "0.3.1", optional = true }
 
 [features]
 default = []
