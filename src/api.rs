@@ -362,6 +362,12 @@ impl AppState {
         Arc::clone(&self.inner.store)
     }
 
+    /// Shared handle to the inference engine (`embed` / `complete` /
+    /// `embedding_dim`) — used by the graph endpoints in `graph_api`.
+    pub fn engine(&self) -> Arc<dyn InferenceEngine> {
+        Arc::clone(&self.inner.engine)
+    }
+
     /// The learn → store → retrieve → augment loop (DESIGN.md §1.3).
     ///
     /// 1. **Embed** the prompt (768-dim, via the engine directly — async, no
@@ -600,6 +606,9 @@ impl AppState {
 // ===========================================================================
 
 /// Build the Ollama-compatible axum router over the given [`AppState`].
+///
+/// Also mounts the knowledge-graph endpoints from [`crate::graph_api`]
+/// (`/api/ingest`, `/api/search`, `/api/classify`, `/api/graph/stats`).
 pub fn router(state: AppState) -> Router {
     Router::new()
         .route("/", get(root))
@@ -609,6 +618,7 @@ pub fn router(state: AppState) -> Router {
         .route("/api/chat", post(chat))
         .route("/api/embeddings", post(embeddings))
         .route("/api/embed", post(embed))
+        .merge(crate::graph_api::routes())
         .with_state(state)
 }
 
@@ -617,7 +627,7 @@ pub fn router(state: AppState) -> Router {
 // ---------------------------------------------------------------------------
 
 /// HTTP error returned as Ollama-shaped `{"error": "..."}` JSON.
-struct ApiError(StatusCode, String);
+pub(crate) struct ApiError(pub(crate) StatusCode, pub(crate) String);
 
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
@@ -635,7 +645,7 @@ impl From<anyhow::Error> for ApiError {
 /// JSON **regardless of the `Content-Type` header**, matching Ollama's
 /// leniency so plain `curl -d '{...}'` (which sends
 /// `application/x-www-form-urlencoded`) works as a drop-in.
-struct JsonBody<T>(T);
+pub(crate) struct JsonBody<T>(pub(crate) T);
 
 impl<T, S> FromRequest<S> for JsonBody<T>
 where

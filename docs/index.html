@@ -346,6 +346,11 @@ state. The <code>router</code> exposes the Ollama API.</p>
   <tr><td><code>GET /api/tags</code></td><td>List available models.</td></tr>
   <tr><td><code>GET /api/version</code></td><td>Version info.</td></tr>
   <tr><td><code>GET /</code></td><td>Health — <code>"Ollama is running"</code>.</td></tr>
+  <tr><td><code>POST /api/ingest</code></td><td>Knowledge graph: bulk-load pre-embedded nodes + edges keyed by <code>ref</code> (idempotent; 256&nbsp;MB body limit).</td></tr>
+  <tr><td><code>POST /api/search</code></td><td>Knowledge graph: embed <code>text</code>, k-NN over the exact index (optional <code>labels</code> filter), 1-hop outgoing neighbours; <code>similarity</code> is cosine in [0,1].</td></tr>
+  <tr><td><code>POST /api/classify</code></td><td>Knowledge graph: tariff-code classification by similarity voting at every prefix level (2/4/6/8/10); the description is normalised first, with optional <code>expand</code> (LLM rewrite before embedding) and <code>llm</code> arbitration.</td></tr>
+  <tr><td><code>POST /api/complete</code></td><td>Raw, stateless completion (no cache, no GraphRAG, nothing stored) capped at <code>max_tokens</code> (default 256), for pipelines that run their own retrieval.</td></tr>
+  <tr><td><code>GET /api/graph/stats</code></td><td>Knowledge graph: node counts per label, edge count, vector-index size.</td></tr>
 </table>
 <p class="muted">A lenient body extractor parses requests regardless of <code>Content-Type</code>, so
 plain <code>curl -d</code> works as a drop-in. Streaming is currently post-hoc chunking (see roadmap).</p>
