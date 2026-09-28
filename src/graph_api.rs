@@ -180,8 +180,10 @@ struct Hit {
     similarity: f32,
 }
 
-/// k-NN over the exact index with an optional label filter (over-fetching
-/// `LABEL_OVERFETCH × k` when filtering), returning at most `k` loaded nodes.
+/// k-NN over the exact index with an optional label filter, returning at most
+/// `k` loaded nodes. When filtering, it over-fetches `LABEL_OVERFETCH × k`
+/// and keeps widening the fetch until `k` nodes carry a wanted label or the
+/// index is exhausted, so a rare label is not crowded out by other nodes.
 fn vector_hits(
     store: &KnowledgeStore,
     query: &[f32],
@@ -189,30 +191,38 @@ fn vector_hits(
     labels: Option<&[String]>,
 ) -> Result<Vec<Hit>, ApiError> {
     let index = store.vector_index_ref();
-    let fetch = if labels.is_some() { k.saturating_mul(LABEL_OVERFETCH) } else { k };
-    let results = index.search(query, fetch).map_err(internal)?;
     let metric = index.metric();
     let graph = store.graph_ops();
 
+    let mut fetch = if labels.is_some() { k.saturating_mul(LABEL_OVERFETCH) } else { k };
+    let mut scanned = 0;
     let mut hits = Vec::with_capacity(k);
-    for r in results {
-        let Some(node) = graph.get_node(r.node_id).map_err(internal)? else {
-            continue; // index entry without a node (should not happen)
-        };
-        if let Some(wanted) = labels {
-            if !node.labels.iter().any(|l| wanted.iter().any(|w| w == l)) {
-                continue;
+    loop {
+        let results = index.search(query, fetch).map_err(internal)?;
+        let exhausted = results.len() < fetch;
+        for r in results.into_iter().skip(scanned) {
+            scanned += 1;
+            let Some(node) = graph.get_node(r.node_id).map_err(internal)? else {
+                continue; // index entry without a node (should not happen)
+            };
+            if let Some(wanted) = labels {
+                if !node.labels.iter().any(|l| wanted.iter().any(|w| w == l)) {
+                    continue;
+                }
+            }
+            hits.push(Hit {
+                node,
+                similarity: similarity_from_distance(metric, r.distance),
+            });
+            if hits.len() >= k {
+                return Ok(hits);
             }
         }
-        hits.push(Hit {
-            node,
-            similarity: similarity_from_distance(metric, r.distance),
-        });
-        if hits.len() >= k {
-            break;
+        if labels.is_none() || exhausted {
+            return Ok(hits);
         }
+        fetch = fetch.saturating_mul(LABEL_OVERFETCH);
     }
-    Ok(hits)
 }
 
 /// All outgoing 1-hop neighbours of `id` as `(edge_type, node)`.
@@ -428,8 +438,9 @@ struct SearchRequest {
 }
 
 /// `POST /api/search` — embed `text`, k-NN over the exact index (optionally
-/// keeping only hits with at least one of `labels`, over-fetching 4×k before
-/// filtering) and expand each hit with all its outgoing 1-hop neighbours.
+/// keeping only hits with at least one of `labels`, widening the fetch until
+/// `k` such hits are found) and expand each hit with all its outgoing 1-hop
+/// neighbours.
 async fn search(
     State(state): State<AppState>,
     JsonBody(req): JsonBody<SearchRequest>,

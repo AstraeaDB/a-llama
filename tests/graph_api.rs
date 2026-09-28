@@ -295,6 +295,29 @@ async fn search_returns_chunk_with_neighbor_codes() {
     assert_eq!(status, StatusCode::BAD_REQUEST);
 }
 
+#[tokio::test(flavor = "multi_thread")]
+async fn search_label_filter_finds_rare_label_behind_many_closer_nodes() {
+    // 50 "Bulk" nodes identical to the query rank ahead of the one "Rare" node;
+    // a fixed 4×k over-fetch (k = 2 → 8) would never reach it.
+    let state = state();
+    let query = "brass candle holder";
+    let emb = embed(query).await;
+    let mut nodes: Vec<Value> = (0..50)
+        .map(|i| json!({ "ref": format!("bulk:{i}"), "labels": ["Bulk"], "properties": {}, "embedding": emb }))
+        .collect();
+    nodes.push(json!({ "ref": "rare:1", "labels": ["Rare"], "properties": { "text": CHUNK_CLIPS },
+                       "embedding": embed(CHUNK_CLIPS).await }));
+    let (status, _) = call(&state, post_json("/api/ingest", json!({ "nodes": nodes }))).await;
+    assert_eq!(status, StatusCode::OK);
+
+    let (status, v) = call(&state, post_json("/api/search", json!({ "text": query, "k": 2, "labels": ["Rare"] })))
+        .await;
+    assert_eq!(status, StatusCode::OK, "{v}");
+    let hits = v["hits"].as_array().unwrap();
+    assert_eq!(hits.len(), 1, "{v}");
+    assert_eq!(hits[0]["properties"]["ref"], "rare:1");
+}
+
 // ===========================================================================
 // /api/classify
 // ===========================================================================
