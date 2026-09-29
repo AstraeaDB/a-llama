@@ -74,6 +74,18 @@
 //! to disk. WAL durability is unconditional (astraeadb #27 fix); `persist`
 //! only writes a checkpoint. The [`ExactVectorIndex`] needs no snapshot file.
 //!
+//! ## Bulk ingest (`/api/ingest`, see `src/graph_api.rs`)
+//!
+//! [`KnowledgeStore::ingest_node`] / [`KnowledgeStore::ingest_edge`] load
+//! caller-defined nodes (any labels, any properties, optional precomputed
+//! embedding) keyed by a caller-chosen string **`ref`**. The ref is stored in
+//! the node's properties as `"ref"` and mirrored in a fourth dedup index
+//! (`ref_index`) so a repeated ingest of the same ref is idempotent. Nodes
+//! carrying a `code` property (a tariff code — see [`normalize_code`]) are also
+//! mirrored in `code_index` so `/api/classify` can look up the title of any
+//! code level. Both maps are rebuilt on [`open_durable`](KnowledgeStore::open_durable)
+//! by the same full node walk that repopulates the vector index.
+//!
 //! [`ExactVectorIndex`]: crate::exact_index::ExactVectorIndex
 //!
 //! ### astraeadb issue #26 — page size constraint
@@ -85,14 +97,14 @@
 //! methods do not enforce this limit; a storage-layer error will propagate if
 //! the record is too large.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex};
 
 use anyhow::{anyhow, Result};
 use serde_json::{json, Value};
 
 use astraea_core::traits::{GraphOps, VectorIndex};
-use astraea_core::types::{EdgeId, NodeId};
+use astraea_core::types::{Direction, EdgeId, NodeId};
 use astraea_graph::Graph;
 use astraea_graph::test_utils::InMemoryStorage;
 
@@ -108,6 +120,56 @@ use astraea_storage::DiskStorageEngine;
 /// Every vector index, Eunomia hot store, and in-process `EmbeddingProvider`
 /// must agree on this value.
 pub const DEFAULT_DIM: usize = 768;
+
+/// Valid tariff-code lengths (chapter / heading / subheading / 8- and
+/// 10-digit national lines).
+pub const CODE_LEVELS: [usize; 5] = [2, 4, 6, 8, 10];
+
+/// Normalise a tariff code: keep only ASCII digits (so `"9405 50 00"`,
+/// `"9405.50.00"` and `"94055000"` all map to `"94055000"`) and accept only
+/// the lengths in [`CODE_LEVELS`]. Returns `None` for anything else.
+pub fn normalize_code(raw: &str) -> Option<String> {
+    let digits: String = raw.chars().filter(char::is_ascii_digit).collect();
+    if CODE_LEVELS.contains(&digits.len()) {
+        Some(digits)
+    } else {
+        None
+    }
+}
+
+/// The normalised tariff code carried by a node's properties (`"code"` as a
+/// string or an integer), if it is a valid code.
+pub fn code_property(properties: &Value) -> Option<String> {
+    match properties.get("code")? {
+        Value::String(s) => normalize_code(s),
+        Value::Number(n) => normalize_code(&n.to_string()),
+        _ => None,
+    }
+}
+
+/// Outcome of [`KnowledgeStore::ingest_node`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct IngestedNode {
+    /// The node's id (freshly allocated, or the existing one for a known ref).
+    pub id: NodeId,
+    /// `true` if this call created the node, `false` if the ref already existed.
+    pub created: bool,
+}
+
+/// Snapshot returned by [`KnowledgeStore::stats`].
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct GraphStats {
+    /// Total node count.
+    pub nodes: usize,
+    /// Node count per label (a node with several labels is counted under each).
+    pub nodes_by_label: BTreeMap<String, usize>,
+    /// Exact edge count (sum of every node's outgoing edges).
+    pub edges: usize,
+    /// Vectors currently held by the exact index.
+    pub vector_index_size: usize,
+    /// Entries in the `ref` → node map.
+    pub refs: usize,
+}
 
 /// Embedded knowledge store for a-llama.
 ///
@@ -167,6 +229,16 @@ pub struct KnowledgeStore {
     /// `"{kind}\x00{name}"` → NodeId for `Entity` nodes.
     entity_index: Mutex<HashMap<String, NodeId>>,
 
+    /// Caller-chosen `ref` → NodeId for nodes loaded through
+    /// [`ingest_node`](KnowledgeStore::ingest_node). The ref is also stored on
+    /// the node as the `"ref"` property, which is what the durable rebuild reads.
+    ref_index: Mutex<HashMap<String, NodeId>>,
+
+    /// Normalised tariff `code` → NodeId for every node carrying a valid
+    /// `code` property (first node wins). Lets `/api/classify` attach a title
+    /// to any code level, including prefixes that were never a direct hit.
+    code_index: Mutex<HashMap<String, NodeId>>,
+
     /// Data directory for the durable backend (set by [`open_durable`], `None`
     /// in in-memory mode). Used by [`persist`] to determine whether to issue
     /// a storage flush. The [`ExactVectorIndex`] needs no snapshot file and
@@ -204,6 +276,8 @@ impl KnowledgeStore {
             cache_entry_index: Mutex::new(HashMap::new()),
             fact_index: Mutex::new(HashMap::new()),
             entity_index: Mutex::new(HashMap::new()),
+            ref_index: Mutex::new(HashMap::new()),
+            code_index: Mutex::new(HashMap::new()),
             #[cfg(feature = "durable")]
             data_dir: None,
         })
@@ -328,27 +402,62 @@ impl KnowledgeStore {
             }
         }
 
-        // --- Phase 3b: repopulate the exact vector index from ALL persisted
-        //     embedding-bearing nodes, independent of the dedup label scans. ---
+        // --- Phase 3b: one full walk over ALL persisted nodes, independent of
+        //     the dedup label scans, to (1) repopulate the exact vector index
+        //     and (2) rebuild the `ref` and `code` maps. ---
         //
         // The dedup walk above is label-driven (CacheEntry / Fact / Entity); any
-        // other embedding-bearing node — e.g. a caller-created `Product` — would
-        // otherwise be persisted but invisible to vector search after reopen
-        // (a-llama#1). `Graph::rebuild_vector_index` walks
-        // `StorageEngine::list_all_nodes` and inserts every node whose embedding
-        // is `Some(..)` into the attached index, returning the count. Inserts are
-        // idempotent (ExactVectorIndex overwrites by node_id), so this pass is
-        // authoritative regardless of what the dedup scans touched.
-        let vectors_indexed = graph
-            .rebuild_vector_index()
-            .map_err(|e| anyhow!("rebuild_vector_index failed: {e}"))?;
+        // other embedding-bearing node — e.g. a caller-created `Product` or an
+        // ingested `Chunk` — would otherwise be persisted but invisible to
+        // vector search after reopen (a-llama#1). This mirrors
+        // `Graph::rebuild_vector_index` (walk `StorageEngine::list_all_nodes`,
+        // insert every node whose embedding is `Some(..)`), and in the same
+        // pass picks up the `"ref"` / `"code"` properties written by
+        // `ingest_node`, so ingested refs resolve again after a restart.
+        // Inserts are idempotent (ExactVectorIndex overwrites by node_id), so
+        // this pass is authoritative regardless of what the dedup scans touched.
+        let mut ref_index: HashMap<String, NodeId> = HashMap::new();
+        let mut code_index: HashMap<String, NodeId> = HashMap::new();
+        let mut vectors_indexed = 0usize;
+        let all_ids = graph
+            .list_all_nodes()
+            .map_err(|e| anyhow!("list_all_nodes failed: {e}"))?;
+        for node_id in all_ids {
+            let Some(node) = graph
+                .get_node(node_id)
+                .map_err(|e| anyhow!("get_node {node_id:?} failed: {e}"))?
+            else {
+                continue;
+            };
+            if let Some(emb) = &node.embedding {
+                vi.insert(node_id, emb)
+                    .map_err(|e| anyhow!("vector index rebuild insert {node_id:?} failed: {e}"))?;
+                vectors_indexed += 1;
+            }
+            // `list_all_nodes` order is unspecified; keep the lowest id for a
+            // (never expected) duplicate so the rebuild is deterministic.
+            if let Some(r) = node.properties.get("ref").and_then(Value::as_str) {
+                ref_index
+                    .entry(r.to_string())
+                    .and_modify(|existing| *existing = (*existing).min(node_id))
+                    .or_insert(node_id);
+            }
+            if let Some(code) = code_property(&node.properties) {
+                code_index
+                    .entry(code)
+                    .and_modify(|existing| *existing = (*existing).min(node_id))
+                    .or_insert(node_id);
+            }
+        }
 
         eprintln!(
             "a-llama: durable graph opened from {data_dir:?} \
-             (nodes_in_dedup: ce={}, fact={}, entity={}; vectors_indexed={})",
+             (nodes_in_dedup: ce={}, fact={}, entity={}, ref={}, code={}; vectors_indexed={})",
             cache_entry_index.len(),
             fact_index.len(),
             entity_index.len(),
+            ref_index.len(),
+            code_index.len(),
             vectors_indexed,
         );
 
@@ -359,6 +468,8 @@ impl KnowledgeStore {
             cache_entry_index: Mutex::new(cache_entry_index),
             fact_index: Mutex::new(fact_index),
             entity_index: Mutex::new(entity_index),
+            ref_index: Mutex::new(ref_index),
+            code_index: Mutex::new(code_index),
             data_dir: Some(data_dir.to_path_buf()),
         })
     }
@@ -701,6 +812,151 @@ impl KnowledgeStore {
     }
 
     // -----------------------------------------------------------------------
+    // Bulk ingest by caller-chosen `ref` (`/api/ingest`)
+    // -----------------------------------------------------------------------
+
+    /// Resolve a caller-chosen `ref` to its [`NodeId`], if it was ingested
+    /// (in this process, or in an earlier one in durable mode).
+    pub fn resolve_ref(&self, ref_key: &str) -> Option<NodeId> {
+        self.ref_index.lock().unwrap().get(ref_key).copied()
+    }
+
+    /// Number of refs currently known.
+    pub fn ref_count(&self) -> usize {
+        self.ref_index.lock().unwrap().len()
+    }
+
+    /// Node carrying the given (normalised) tariff `code`, if any was ingested.
+    pub fn node_by_code(&self, code: &str) -> Option<NodeId> {
+        let code = normalize_code(code)?;
+        self.code_index.lock().unwrap().get(&code).copied()
+    }
+
+    /// Create a node keyed by a caller-chosen `ref` (idempotent).
+    ///
+    /// - If `ref_key` is already known, **nothing is written** and the existing
+    ///   id is returned with `created == false` (properties are not updated).
+    /// - Otherwise the node is created through [`GraphOps::create_node`] with
+    ///   the given `labels`, `properties` (a JSON object or `null`; `"ref"` is
+    ///   set to `ref_key`) and optional precomputed `embedding` (validated
+    ///   against the store's dimension) — so the graph and the exact vector
+    ///   index stay in sync exactly as for [`upsert_fact`](Self::upsert_fact).
+    ///   A valid `code` property is mirrored in the code map.
+    ///
+    /// The ref map is held for the whole create, so concurrent ingests of the
+    /// same ref cannot race into a duplicate.
+    pub fn ingest_node(
+        &self,
+        ref_key: &str,
+        labels: Vec<String>,
+        properties: Value,
+        embedding: Option<Vec<f32>>,
+    ) -> Result<IngestedNode> {
+        if ref_key.is_empty() {
+            return Err(anyhow!("ingest_node: ref must not be empty"));
+        }
+        if let Some(emb) = &embedding {
+            self.check_dim(emb)?;
+        }
+        let mut props = match properties {
+            Value::Object(map) => Value::Object(map),
+            Value::Null => json!({}),
+            other => {
+                return Err(anyhow!(
+                    "ingest_node: properties for ref {ref_key:?} must be a JSON object, got {other}"
+                ))
+            }
+        };
+
+        let mut refs = self.ref_index.lock().unwrap();
+        if let Some(&id) = refs.get(ref_key) {
+            return Ok(IngestedNode { id, created: false });
+        }
+
+        props["ref"] = Value::String(ref_key.to_string());
+        let code = code_property(&props);
+        let id = self
+            .graph
+            .create_node(labels, props, embedding)
+            .map_err(|e| anyhow!("ingest_node create_node failed for ref {ref_key:?}: {e}"))?;
+        refs.insert(ref_key.to_string(), id);
+        drop(refs);
+
+        if let Some(code) = code {
+            self.code_index.lock().unwrap().entry(code).or_insert(id);
+        }
+        Ok(IngestedNode { id, created: true })
+    }
+
+    /// Create a typed, weighted edge between two ingested nodes.
+    ///
+    /// With `dedupe == true`, an existing `src -[edge_type]-> dst` edge is
+    /// reused instead of duplicated and `Ok(None)` is returned; the check costs
+    /// one outgoing-adjacency read on `src`, so callers skip it for nodes they
+    /// have just created. Endpoints that do not exist fail with the underlying
+    /// `NodeNotFound` error.
+    pub fn ingest_edge(
+        &self,
+        src: NodeId,
+        dst: NodeId,
+        edge_type: &str,
+        weight: f64,
+        properties: Value,
+        dedupe: bool,
+    ) -> Result<Option<EdgeId>> {
+        if dedupe {
+            let existing = self
+                .graph
+                .neighbors_filtered(src, Direction::Outgoing, edge_type)
+                .map_err(|e| anyhow!("ingest_edge neighbors_filtered failed: {e}"))?;
+            if existing.iter().any(|(_, nid)| *nid == dst) {
+                return Ok(None);
+            }
+        }
+        let id = self
+            .graph
+            .create_edge(src, dst, edge_type.to_string(), properties, weight, None, None)
+            .map_err(|e| anyhow!("ingest_edge create_edge failed: {e}"))?;
+        Ok(Some(id))
+    }
+
+    /// Exact graph statistics: one walk over every node (labels + outgoing
+    /// edge count) plus the vector-index and ref-map sizes.
+    ///
+    /// O(nodes + edges) on the durable backend (adjacency index). On the
+    /// in-memory test backend each outgoing-edge lookup scans the whole edge
+    /// map, so it is O(nodes × edges) there — fine at test sizes, and this is a
+    /// diagnostics call.
+    pub fn stats(&self) -> Result<GraphStats> {
+        let ids = self
+            .graph
+            .list_all_nodes()
+            .map_err(|e| anyhow!("stats list_all_nodes failed: {e}"))?;
+        let mut stats = GraphStats::default();
+        for id in ids {
+            let Some(node) = self
+                .graph
+                .get_node(id)
+                .map_err(|e| anyhow!("stats get_node {id:?} failed: {e}"))?
+            else {
+                continue;
+            };
+            stats.nodes += 1;
+            for label in node.labels {
+                *stats.nodes_by_label.entry(label).or_insert(0) += 1;
+            }
+            stats.edges += self
+                .graph
+                .neighbors(id, Direction::Outgoing)
+                .map_err(|e| anyhow!("stats neighbors {id:?} failed: {e}"))?
+                .len();
+        }
+        stats.vector_index_size = self.vector_index.len();
+        stats.refs = self.ref_count();
+        Ok(stats)
+    }
+
+    // -----------------------------------------------------------------------
     // GraphRAG accessors (Task 4 integration)
     // -----------------------------------------------------------------------
 
@@ -761,7 +1017,6 @@ impl KnowledgeStore {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use astraea_core::types::Direction;
 
     /// Build a small, deterministic L2-normalised embedding of `dim` dimensions.
     ///
@@ -1307,6 +1562,101 @@ mod tests {
             "top-3 search must return all three facts; got {ids:?}");
     }
 
+    // --- Ingest by ref ---
+
+    #[test]
+    fn normalize_code_accepts_only_tariff_lengths() {
+        assert_eq!(normalize_code("9405 50 00").as_deref(), Some("94055000"));
+        assert_eq!(normalize_code("9405.50").as_deref(), Some("940550"));
+        assert_eq!(normalize_code("94").as_deref(), Some("94"));
+        assert_eq!(normalize_code("9405500000").as_deref(), Some("9405500000"));
+        assert_eq!(normalize_code("940"), None, "odd length is not a code");
+        assert_eq!(normalize_code("940550000000"), None, "12 digits is too long");
+        assert_eq!(normalize_code("lamps"), None);
+        assert_eq!(code_property(&json!({ "code": 9405 })).as_deref(), Some("9405"));
+        assert_eq!(code_property(&json!({ "code": ["9405"] })), None);
+        assert_eq!(code_property(&json!({ "title": "x" })), None);
+    }
+
+    #[test]
+    fn ingest_node_is_idempotent_by_ref_and_indexes_embedding() {
+        let dim = 4;
+        let store = KnowledgeStore::with_dim(dim).unwrap();
+        let emb = make_embedding(0, dim);
+
+        let first = store
+            .ingest_node(
+                "h:9405",
+                vec!["Heading".into(), "Tariff".into()],
+                json!({ "code": "9405", "title": "Lamps" }),
+                Some(emb.clone()),
+            )
+            .unwrap();
+        assert!(first.created);
+        assert_eq!(store.resolve_ref("h:9405"), Some(first.id));
+        assert_eq!(store.node_by_code("9405"), Some(first.id));
+        assert_eq!(store.node_by_code("94.05"), Some(first.id), "lookup is normalised");
+        assert_eq!(store.ref_count(), 1);
+
+        // Same ref again: no write, same id, properties untouched.
+        let again = store
+            .ingest_node("h:9405", vec![], json!({ "title": "changed" }), None)
+            .unwrap();
+        assert_eq!(again, IngestedNode { id: first.id, created: false });
+        let node = store.graph_ops().get_node(first.id).unwrap().unwrap();
+        assert_eq!(node.properties["title"], "Lamps");
+        assert_eq!(node.properties["ref"], "h:9405", "ref is stored on the node");
+        assert_eq!(store.graph_ops().find_by_label("Heading").unwrap().len(), 1);
+
+        // Embedding was indexed through create_node.
+        let hits = store.vector_index_ref().search(&emb, 1).unwrap();
+        assert_eq!(hits[0].node_id, first.id);
+
+        // Validation.
+        assert!(store.ingest_node("", vec![], json!({}), None).is_err(), "empty ref");
+        assert!(
+            store.ingest_node("bad-dim", vec![], json!({}), Some(vec![1.0, 0.0])).is_err(),
+            "dimension mismatch"
+        );
+        assert!(
+            store.ingest_node("bad-props", vec![], json!([1, 2]), None).is_err(),
+            "properties must be an object"
+        );
+        assert_eq!(store.resolve_ref("bad-dim"), None, "failed ingest leaves no ref");
+    }
+
+    #[test]
+    fn ingest_edge_dedupes_and_stats_are_exact() {
+        let dim = 4;
+        let store = KnowledgeStore::with_dim(dim).unwrap();
+        let a = store
+            .ingest_node("a", vec!["Chunk".into()], json!({}), Some(make_embedding(0, dim)))
+            .unwrap()
+            .id;
+        let b = store
+            .ingest_node("b", vec!["Heading".into(), "Tariff".into()], json!({ "code": "94" }), None)
+            .unwrap()
+            .id;
+
+        assert!(store.ingest_edge(a, b, "DESCRIBES", 1.0, json!({}), false).unwrap().is_some());
+        // Dedupe: same (src, type, dst) is skipped …
+        assert!(store.ingest_edge(a, b, "DESCRIBES", 1.0, json!({}), true).unwrap().is_none());
+        // … but a different type is a new edge, and dedupe=false always writes.
+        assert!(store.ingest_edge(a, b, "RULING_FOR", 0.5, json!({}), true).unwrap().is_some());
+        assert!(store.ingest_edge(a, b, "DESCRIBES", 1.0, json!({}), false).unwrap().is_some());
+        // Unknown endpoint fails.
+        assert!(store.ingest_edge(a, NodeId(999), "X", 1.0, json!({}), false).is_err());
+
+        let stats = store.stats().unwrap();
+        assert_eq!(stats.nodes, 2);
+        assert_eq!(stats.edges, 3);
+        assert_eq!(stats.vector_index_size, 1);
+        assert_eq!(stats.refs, 2);
+        assert_eq!(stats.nodes_by_label.get("Chunk"), Some(&1));
+        assert_eq!(stats.nodes_by_label.get("Heading"), Some(&1));
+        assert_eq!(stats.nodes_by_label.get("Tariff"), Some(&1));
+    }
+
     // --- Accessor type checks ---
 
     #[test]
@@ -1522,6 +1872,63 @@ mod durable_tests {
                 *id,
                 "session {i} must be the nearest node for its own embedding"
             );
+        }
+    }
+
+    /// The `ref` and `code` maps written by `ingest_node` are rebuilt from the
+    /// persisted `"ref"` / `"code"` properties on reopen, so a later ingest of
+    /// the same ref is idempotent and edges can reference old refs.
+    #[test]
+    fn durable_open_rebuilds_ref_and_code_maps() {
+        let dir = tmp_dir("ref_map");
+        let dim = 4;
+
+        let (heading_id, chunk_id) = {
+            let store = KnowledgeStore::open_durable(&dir.0, dim).unwrap();
+            let h = store
+                .ingest_node(
+                    "h:9405",
+                    vec!["Heading".into(), "Tariff".into()],
+                    serde_json::json!({ "code": "9405", "title": "Lamps" }),
+                    Some(make_embedding(0, dim)),
+                )
+                .unwrap();
+            let c = store
+                .ingest_node(
+                    "c:1",
+                    vec!["Chunk".into()],
+                    serde_json::json!({ "text": "a lamp" }),
+                    Some(make_embedding(1, dim)),
+                )
+                .unwrap();
+            assert!(h.created && c.created);
+            store.persist().unwrap();
+            (h.id, c.id)
+        };
+
+        {
+            let store = KnowledgeStore::open_durable(&dir.0, dim).unwrap();
+            assert_eq!(store.resolve_ref("h:9405"), Some(heading_id), "ref map rebuilt");
+            assert_eq!(store.resolve_ref("c:1"), Some(chunk_id));
+            assert_eq!(store.ref_count(), 2);
+            assert_eq!(store.node_by_code("9405"), Some(heading_id), "code map rebuilt");
+
+            // Re-ingest is idempotent after reopen …
+            let again = store
+                .ingest_node("h:9405", vec![], serde_json::json!({}), None)
+                .unwrap();
+            assert_eq!(again, IngestedNode { id: heading_id, created: false });
+            assert_eq!(store.graph_ops().find_by_label("Heading").unwrap().len(), 1);
+
+            // … an edge can reference refs from the previous session …
+            let edge = store
+                .ingest_edge(chunk_id, heading_id, "DESCRIBES", 1.0, serde_json::json!({}), true)
+                .unwrap();
+            assert!(edge.is_some());
+
+            // … and the ingested embedding is searchable again.
+            let hits = store.vector_index_ref().search(&make_embedding(1, dim), 1).unwrap();
+            assert_eq!(hits[0].node_id, chunk_id);
         }
     }
 

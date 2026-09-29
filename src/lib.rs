@@ -33,3 +33,8 @@ pub mod api;
 /// LLM-based fact/entity extraction: distills `Fact`/`Entity` nodes + edges from
 /// interactions so learned knowledge is independently retrievable (Task 9, M2).
 pub mod extract;
+
+/// Knowledge-graph HTTP endpoints: bulk ingest of pre-embedded nodes/edges by
+/// caller-chosen `ref`, raw vector search with 1-hop expansion, tariff-code
+/// classification by similarity voting, and graph statistics.
+pub mod graph_api;

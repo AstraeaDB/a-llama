@@ -47,6 +47,20 @@ pub trait InferenceEngine: Send + Sync {
     /// (the GraphRAG-assembled system context). Returns the generated text.
     async fn complete(&self, prompt: &str, ctx: Option<&str>) -> anyhow::Result<String>;
 
+    /// Like [`complete`](InferenceEngine::complete) with an explicit cap on the
+    /// number of generated tokens, for short structured answers where a model
+    /// that misses its stop token must not run to the engine-wide limit. The
+    /// default ignores the cap.
+    async fn complete_capped(
+        &self,
+        prompt: &str,
+        ctx: Option<&str>,
+        max_tokens: usize,
+    ) -> anyhow::Result<String> {
+        let _ = max_tokens;
+        self.complete(prompt, ctx).await
+    }
+
     /// Embed a single text into a fixed-dimension vector. The length must equal
     /// [`InferenceEngine::embedding_dim`] (768 for embeddinggemma).
     async fn embed(&self, text: &str) -> anyhow::Result<Vec<f32>>;
@@ -211,9 +225,39 @@ impl InferenceEngine for MockEngine {
 pub struct MistralRsEngine {
     chat: mistralrs::Model,
     embed: mistralrs::Model,
+    /// CPU/F32 copy of the embedder used for very short inputs when the main
+    /// embedder runs in a reduced dtype on the GPU: candle's Metal attention
+    /// switches to a "vector" kernel for sequences of <= 8 tokens, which returns
+    /// garbage for embeddinggemma in BF16 on M1-class GPUs.
+    embed_short: Option<mistralrs::Model>,
     embedding_dim: usize,
     max_output_tokens: usize,
     input_context_tokens: usize,
+}
+
+/// `A_LLAMA_NO_THINK=1` runs hybrid reasoning models (e.g. Qwen3-8B) in
+/// non-thinking mode by appending Qwen's `/no_think` soft switch to the prompt.
+#[cfg(feature = "mistralrs-engine")]
+fn no_think_prompt(prompt: &str) -> String {
+    match std::env::var("A_LLAMA_NO_THINK").as_deref() {
+        Ok("1") | Ok("true") => format!("{prompt} /no_think"),
+        _ => prompt.to_string(),
+    }
+}
+
+/// Removes the leading `<think>…</think>` block a reasoning model emits (empty
+/// in non-thinking mode). An unterminated block — reasoning cut off by a token
+/// cap — yields an empty answer so callers fall back instead of parsing thoughts.
+#[cfg(feature = "mistralrs-engine")]
+fn strip_think(text: &str) -> String {
+    let t = text.trim_start();
+    match t.strip_prefix("<think>") {
+        Some(rest) => match rest.find("</think>") {
+            Some(end) => rest[end + "</think>".len()..].trim_start().to_string(),
+            None => String::new(),
+        },
+        None => text.to_string(),
+    }
 }
 
 #[cfg(feature = "mistralrs-engine")]
@@ -246,8 +290,20 @@ impl MistralRsEngine {
         // softcapping, pooling) produces a degenerate all-zero vector under the
         // default F16 on CPU; F32 yields correct, non-zero embeddings. The chat
         // model is unaffected and keeps its default dtype.
+        // Skip auto device mapping for the embedder: on macOS CPU it can read
+        // 0 MB available after the chat model loads and refuse to load.
+        // `A_LLAMA_EMBED_DTYPE` (f32 default | bf16 | f16) overrides the dtype:
+        // on Metal GPUs with 32 KB threadgroup memory the F32 kernels overflow,
+        // while BF16 fits.
+        let embed_dtype = match std::env::var("A_LLAMA_EMBED_DTYPE").as_deref() {
+            Ok("bf16") | Ok("BF16") => ModelDType::BF16,
+            Ok("f16") | Ok("F16") => ModelDType::F16,
+            _ => ModelDType::F32,
+        };
+        let use_short_fallback = !matches!(embed_dtype, ModelDType::F32);
         let embed = EmbeddingModelBuilder::new(embed_id.clone())
-            .with_dtype(ModelDType::F32)
+            .with_dtype(embed_dtype)
+            .with_device_mapping(mistralrs::DeviceMapSetting::dummy())
             .with_logging()
             .build()
             .await?;
@@ -285,9 +341,23 @@ impl MistralRsEngine {
             );
         }
 
+        let embed_short = if use_short_fallback {
+            Some(
+                EmbeddingModelBuilder::new(embed_id.clone())
+                    .with_dtype(ModelDType::F32)
+                    .with_force_cpu()
+                    .with_device_mapping(mistralrs::DeviceMapSetting::dummy())
+                    .build()
+                    .await?,
+            )
+        } else {
+            None
+        };
+
         Ok(Self {
             chat,
             embed,
+            embed_short,
             embedding_dim,
             // Conservative defaults; TODO: derive from the loaded model's config.
             max_output_tokens: 4096,
@@ -309,7 +379,7 @@ impl InferenceEngine for MistralRsEngine {
                 messages = messages.add_message(TextMessageRole::System, c);
             }
         }
-        messages = messages.add_message(TextMessageRole::User, prompt);
+        messages = messages.add_message(TextMessageRole::User, no_think_prompt(prompt));
 
         let response = self.chat.send_chat_request(messages).await?;
         let text = response
@@ -317,14 +387,44 @@ impl InferenceEngine for MistralRsEngine {
             .first()
             .and_then(|c| c.message.content.clone())
             .ok_or_else(|| anyhow::anyhow!("mistralrs chat response had no content"))?;
-        Ok(text)
+        Ok(strip_think(&text))
+    }
+
+    async fn complete_capped(
+        &self,
+        prompt: &str,
+        ctx: Option<&str>,
+        max_tokens: usize,
+    ) -> anyhow::Result<String> {
+        use mistralrs::{RequestBuilder, TextMessageRole};
+
+        let mut req = RequestBuilder::new();
+        if let Some(c) = ctx.filter(|c| !c.is_empty()) {
+            req = req.add_message(TextMessageRole::System, c);
+        }
+        req = req
+            .add_message(TextMessageRole::User, no_think_prompt(prompt))
+            .set_sampler_max_len(max_tokens.max(1));
+        let response = self.chat.send_chat_request(req).await?;
+        let text = response
+            .choices
+            .first()
+            .and_then(|c| c.message.content.clone())
+            .ok_or_else(|| anyhow::anyhow!("mistralrs chat response had no content"))?;
+        Ok(strip_think(&text))
     }
 
     async fn embed(&self, text: &str) -> anyhow::Result<Vec<f32>> {
         use mistralrs::EmbeddingRequest;
 
-        let vectors = self
-            .embed
+        // Inputs of <= 6 words (~8 tokens) fail on the Metal BF16 path; route
+        // them to the CPU copy with a safety margin (see `embed_short`).
+        const SHORT_INPUT_WORDS: usize = 12;
+        let model = match &self.embed_short {
+            Some(cpu) if text.split_whitespace().count() < SHORT_INPUT_WORDS => cpu,
+            _ => &self.embed,
+        };
+        let vectors = model
             .generate_embeddings(EmbeddingRequest::builder().add_prompt(text))
             .await?;
         vectors
